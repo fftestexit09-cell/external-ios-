@@ -165,13 +165,36 @@ private struct QuickTile: View {
     }
 }
 
-struct FilesView: View {
-    @State private var files: [URL] = []
-    @State private var searchText = ""
+private struct ManagedFileItem: Identifiable, Hashable {
+    let url: URL
+    let isDirectory: Bool
+    let size: Int64
+    let modifiedAt: Date?
+    var id: URL { url }
+}
 
-    private var filteredFiles: [URL] {
-        guard !searchText.isEmpty else { return files }
-        return files.filter { $0.lastPathComponent.localizedCaseInsensitiveContains(searchText) }
+struct FilesView: View {
+    @State private var currentDirectory: URL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+    @State private var items: [ManagedFileItem] = []
+    @State private var searchText = ""
+    @State private var showCreateFolder = false
+    @State private var folderName = ""
+    @State private var renameTarget: ManagedFileItem?
+    @State private var renameText = ""
+    @State private var moveTarget: ManagedFileItem?
+    @State private var showMoveSheet = false
+    @State private var errorMessage = ""
+
+    private var rootDirectory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+    }
+
+    private var filteredItems: [ManagedFileItem] {
+        let base = searchText.isEmpty ? items : items.filter { $0.url.lastPathComponent.localizedCaseInsensitiveContains(searchText) }
+        return base.sorted {
+            if $0.isDirectory != $1.isDirectory { return $0.isDirectory && !$1.isDirectory }
+            return $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedAscending
+        }
     }
 
     var body: some View {
@@ -179,74 +202,385 @@ struct FilesView: View {
             ZStack {
                 PremiumBackground()
 
-                VStack(spacing: 14) {
-                    SectionHeader(title: "Arquivos", icon: "folder.fill")
+                VStack(spacing: 12) {
+                    HStack {
+                        if currentDirectory.standardizedFileURL != rootDirectory.standardizedFileURL {
+                            Button {
+                                goUp()
+                            } label: {
+                                Image(systemName: "chevron.left")
+                                    .font(.headline)
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Arquivos")
+                                .font(.title2.bold())
+                            Text(relativePath)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+
+                        Menu {
+                            Button("Nova pasta", systemImage: "folder.badge.plus") {
+                                folderName = ""
+                                showCreateFolder = true
+                            }
+                            Button("Atualizar", systemImage: "arrow.clockwise") {
+                                reload()
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                                .font(.title3)
+                        }
+                    }
 
                     HStack {
                         Image(systemName: "magnifyingglass")
                             .foregroundStyle(.secondary)
-                        TextField("Buscar arquivos", text: $searchText)
+                        TextField("Buscar nesta pasta", text: $searchText)
                             .textInputAutocapitalization(.never)
                     }
                     .padding(12)
                     .background(Color.white.opacity(0.05))
                     .clipShape(RoundedRectangle(cornerRadius: 12))
 
-                    if filteredFiles.isEmpty {
+                    if filteredItems.isEmpty {
                         Spacer()
                         ContentUnavailableView(
-                            "Nenhum arquivo",
+                            searchText.isEmpty ? "Pasta vazia" : "Nada encontrado",
                             systemImage: "folder",
-                            description: Text("Os arquivos do próprio aplicativo aparecerão aqui.")
+                            description: Text(searchText.isEmpty ? "Crie uma pasta ou adicione arquivos ao Documents do app." : "Nenhum item corresponde à busca.")
                         )
                         Spacer()
                     } else {
                         List {
-                            ForEach(filteredFiles, id: \.self) { url in
-                                HStack(spacing: 12) {
-                                    Image(systemName: "doc.fill")
-                                        .foregroundStyle(.purple)
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(url.lastPathComponent)
-                                        Text(fileSize(url))
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                            ForEach(filteredItems) { item in
+                                Button {
+                                    if item.isDirectory {
+                                        currentDirectory = item.url
+                                        searchText = ""
+                                        reload()
                                     }
-                                    Spacer()
+                                } label: {
+                                    FileManagerRow(item: item)
                                 }
+                                .buttonStyle(.plain)
                                 .listRowBackground(Color.clear)
+                                .contextMenu {
+                                    if item.isDirectory {
+                                        Button("Abrir", systemImage: "folder") {
+                                            currentDirectory = item.url
+                                            searchText = ""
+                                            reload()
+                                        }
+                                    }
+                                    Button("Renomear", systemImage: "pencil") {
+                                        renameTarget = item
+                                        renameText = item.url.lastPathComponent
+                                    }
+                                    Button("Mover", systemImage: "folder") {
+                                        moveTarget = item
+                                        showMoveSheet = true
+                                    }
+                                    Button("Excluir", systemImage: "trash", role: .destructive) {
+                                        delete(item)
+                                    }
+                                }
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    Button(role: .destructive) {
+                                        delete(item)
+                                    } label: {
+                                        Label("Excluir", systemImage: "trash")
+                                    }
+
+                                    Button {
+                                        renameTarget = item
+                                        renameText = item.url.lastPathComponent
+                                    } label: {
+                                        Label("Renomear", systemImage: "pencil")
+                                    }
+                                    .tint(.purple)
+                                }
                             }
-                            .onDelete(perform: delete)
                         }
                         .scrollContentBackground(.hidden)
+                        .listStyle(.plain)
                     }
                 }
                 .padding()
+            }
+            .task { reload() }
+            .alert("Nova pasta", isPresented: $showCreateFolder) {
+                TextField("Nome da pasta", text: $folderName)
+                Button("Cancelar", role: .cancel) {}
+                Button("Criar") { createFolder() }
+            }
+            .alert("Renomear", isPresented: Binding(
+                get: { renameTarget != nil },
+                set: { if !$0 { renameTarget = nil } }
+            )) {
+                TextField("Novo nome", text: $renameText)
+                Button("Cancelar", role: .cancel) { renameTarget = nil }
+                Button("Salvar") { renameSelected() }
+            }
+            .sheet(isPresented: $showMoveSheet) {
+                MoveDestinationView(root: rootDirectory, current: currentDirectory) { destination in
+                    moveSelected(to: destination)
+                    showMoveSheet = false
+                }
+                .preferredColorScheme(.dark)
+            }
+            .alert("Erro", isPresented: Binding(
+                get: { !errorMessage.isEmpty },
+                set: { if !$0 { errorMessage = "" } }
+            )) {
+                Button("OK", role: .cancel) { errorMessage = "" }
+            } message: {
+                Text(errorMessage)
+            }
+        }
+    }
+
+    private var relativePath: String {
+        let root = rootDirectory.standardizedFileURL.path
+        let current = currentDirectory.standardizedFileURL.path
+        guard current != root else { return "Documents" }
+        let suffix = current.replacingOccurrences(of: root, with: "")
+        return "Documents" + suffix
+    }
+
+    private func reload() {
+        let fm = FileManager.default
+        guard isInsideRoot(currentDirectory) else {
+            currentDirectory = rootDirectory
+            return reload()
+        }
+        let urls = (try? fm.contentsOfDirectory(at: currentDirectory, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles])) ?? []
+        items = urls.map { url in
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
+            return ManagedFileItem(
+                url: url,
+                isDirectory: values?.isDirectory ?? false,
+                size: Int64(values?.fileSize ?? 0),
+                modifiedAt: values?.contentModificationDate
+            )
+        }
+    }
+
+    private func goUp() {
+        let parent = currentDirectory.deletingLastPathComponent()
+        guard isInsideRoot(parent) else { return }
+        currentDirectory = parent
+        searchText = ""
+        reload()
+    }
+
+    private func createFolder() {
+        let clean = sanitizedName(folderName)
+        guard !clean.isEmpty else {
+            errorMessage = "Digite um nome válido."
+            return
+        }
+        let destination = currentDirectory.appendingPathComponent(clean, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+            reload()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func renameSelected() {
+        guard let item = renameTarget else { return }
+        defer { renameTarget = nil }
+        let clean = sanitizedName(renameText)
+        guard !clean.isEmpty else {
+            errorMessage = "Digite um nome válido."
+            return
+        }
+        let destination = item.url.deletingLastPathComponent().appendingPathComponent(clean, isDirectory: item.isDirectory)
+        guard isInsideRoot(destination) else {
+            errorMessage = "Destino inválido."
+            return
+        }
+        do {
+            try FileManager.default.moveItem(at: item.url, to: destination)
+            reload()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func moveSelected(to destinationFolder: URL) {
+        guard let item = moveTarget else { return }
+        defer { moveTarget = nil }
+        guard isInsideRoot(destinationFolder) else {
+            errorMessage = "Destino inválido."
+            return
+        }
+        if item.isDirectory {
+            let itemPath = item.url.standardizedFileURL.path + "/"
+            let destinationPath = destinationFolder.standardizedFileURL.path + "/"
+            if destinationPath.hasPrefix(itemPath) {
+                errorMessage = "Não é possível mover uma pasta para dentro dela mesma."
+                return
+            }
+        }
+        let destination = destinationFolder.appendingPathComponent(item.url.lastPathComponent, isDirectory: item.isDirectory)
+        do {
+            try FileManager.default.moveItem(at: item.url, to: destination)
+            reload()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func delete(_ item: ManagedFileItem) {
+        do {
+            try FileManager.default.removeItem(at: item.url)
+            reload()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func sanitizedName(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+    }
+
+    private func isInsideRoot(_ url: URL) -> Bool {
+        let root = rootDirectory.standardizedFileURL.path
+        let target = url.standardizedFileURL.path
+        return target == root || target.hasPrefix(root + "/")
+    }
+}
+
+private struct FileManagerRow: View {
+    let item: ManagedFileItem
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: item.isDirectory ? "folder.fill" : iconName)
+                .font(.title3)
+                .foregroundStyle(item.isDirectory ? .purple : .secondary)
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.url.lastPathComponent)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                HStack(spacing: 8) {
+                    Text(item.isDirectory ? "Pasta" : ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file))
+                    if let date = item.modifiedAt {
+                        Text(date, style: .date)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if item.isDirectory {
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    private var iconName: String {
+        switch item.url.pathExtension.lowercased() {
+        case "jpg", "jpeg", "png", "heic", "gif", "webp": return "photo.fill"
+        case "pdf": return "doc.richtext.fill"
+        case "zip": return "archivebox.fill"
+        case "txt", "md", "json", "plist", "xml", "swift", "js", "html", "css": return "doc.text.fill"
+        case "mp4", "mov": return "film.fill"
+        case "mp3", "m4a", "wav": return "waveform"
+        default: return "doc.fill"
+        }
+    }
+}
+
+private struct MoveDestinationView: View {
+    let root: URL
+    let current: URL
+    let onChoose: (URL) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var selected: URL
+    @State private var folders: [URL] = []
+
+    init(root: URL, current: URL, onChoose: @escaping (URL) -> Void) {
+        self.root = root
+        self.current = current
+        self.onChoose = onChoose
+        _selected = State(initialValue: root)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Destino") {
+                    Button {
+                        onChoose(selected)
+                        dismiss()
+                    } label: {
+                        Label("Mover para \(displayPath(selected))", systemImage: "arrow.right.folder.fill")
+                    }
+                }
+
+                if selected.standardizedFileURL != root.standardizedFileURL {
+                    Button {
+                        selected = selected.deletingLastPathComponent()
+                        reload()
+                    } label: {
+                        Label("Voltar", systemImage: "chevron.left")
+                    }
+                }
+
+                ForEach(folders, id: \.self) { folder in
+                    Button {
+                        selected = folder
+                        reload()
+                    } label: {
+                        HStack {
+                            Image(systemName: "folder.fill")
+                                .foregroundStyle(.purple)
+                            Text(folder.lastPathComponent)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Mover item")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancelar") { dismiss() }
+                }
             }
             .task { reload() }
         }
     }
 
     private func reload() {
-        let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        files = (try? FileManager.default.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.fileSizeKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
+        let fm = FileManager.default
+        folders = ((try? fm.contentsOfDirectory(at: selected, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? [])
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+            .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
     }
 
-    private func delete(at offsets: IndexSet) {
-        for index in offsets {
-            let url = filteredFiles[index]
-            try? FileManager.default.removeItem(at: url)
-        }
-        reload()
-    }
-
-    private func fileSize(_ url: URL) -> String {
-        let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    private func displayPath(_ url: URL) -> String {
+        let rootPath = root.standardizedFileURL.path
+        let target = url.standardizedFileURL.path
+        if target == rootPath { return "Documents" }
+        return "Documents" + target.replacingOccurrences(of: rootPath, with: "")
     }
 }
 
