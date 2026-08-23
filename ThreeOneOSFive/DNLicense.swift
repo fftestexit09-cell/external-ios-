@@ -84,7 +84,7 @@ final class DNLicenseManager: ObservableObject {
                 return
             }
 
-            if allowActivation && (code == "NO_MACHINE" || code == "NO_MACHINES") {
+            if allowActivation && code == "NO_MACHINE" {
                 guard let licenseID = result.licenseID, !licenseID.isEmpty else {
                     isLicensed = false
                     message = "Resposta de licença inválida."
@@ -106,13 +106,13 @@ final class DNLicenseManager: ObservableObject {
             case .notConnectedToInternet, .networkConnectionLost:
                 message = "Sem conexão com a internet."
             case .timedOut:
-                message = "O servidor demorou para responder."
+                message = "O Keygen demorou para responder."
             default:
-                message = "Falha de comunicação com o Keygen."
+                message = "Falha de comunicação com o Keygen (\(error.code.rawValue))."
             }
         } catch {
             isLicensed = false
-            message = "Não foi possível validar a licença."
+            message = "Erro ao validar licença: \(error.localizedDescription)"
         }
     }
 
@@ -131,7 +131,7 @@ final class DNLicenseManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 15
+        request.timeoutInterval = 20
         request.setValue("application/vnd.api+json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/vnd.api+json", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONSerialization.data(withJSONObject: [
@@ -150,10 +150,11 @@ final class DNLicenseManager: ObservableObject {
         }
 
         guard (200..<300).contains(http.statusCode) else {
+            let detail = parseAPIError(data) ?? "HTTP \(http.statusCode)"
             if http.statusCode == 404 {
-                return ValidationResult(valid: false, code: "INVALID", detail: "Key não encontrada.", licenseID: nil)
+                return ValidationResult(valid: false, code: "NOT_FOUND", detail: detail, licenseID: nil)
             }
-            throw URLError(.badServerResponse)
+            return ValidationResult(valid: false, code: "HTTP_\(http.statusCode)", detail: detail, licenseID: nil)
         }
 
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -179,7 +180,7 @@ final class DNLicenseManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 15
+        request.timeoutInterval = 20
         request.setValue("application/vnd.api+json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/vnd.api+json", forHTTPHeaderField: "Accept")
         request.setValue("License \(key)", forHTTPHeaderField: "Authorization")
@@ -202,14 +203,22 @@ final class DNLicenseManager: ObservableObject {
             ]
         ])
 
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
         }
 
         guard (200..<300).contains(http.statusCode) else {
-            throw URLError(.cannotCreateFile)
+            let detail = parseAPIError(data) ?? "HTTP \(http.statusCode)"
+            throw NSError(domain: "KeygenActivation", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: detail])
         }
+    }
+
+    private func parseAPIError(_ data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let errors = object["errors"] as? [[String: Any]],
+              let first = errors.first else { return nil }
+        return (first["detail"] as? String) ?? (first["title"] as? String)
     }
 
     private func friendlyMessage(for code: String, detail: String?) -> String {
@@ -226,10 +235,14 @@ final class DNLicenseManager: ObservableObject {
             return "Esta key foi suspensa."
         case "BANNED":
             return "Esta licença foi bloqueada."
-        case "NO_MACHINE", "NO_MACHINES":
+        case "NO_MACHINE":
             return "Esta key ainda não foi ativada neste iPhone."
-        case "INVALID", "NOT_FOUND":
+        case "NOT_FOUND", "INVALID":
             return "Key inválida."
+        case "POLICY_SCOPE_REQUIRED":
+            return "A licença exige a policy correta."
+        case "FINGERPRINT_SCOPE_REQUIRED":
+            return "A licença exige identificação do dispositivo."
         default:
             return detail ?? "Licença não autorizada (\(code))."
         }
@@ -271,6 +284,7 @@ struct DNLicenseActivationView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
                 }
                 Spacer()
             }
