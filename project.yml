@@ -10,15 +10,14 @@ targets:
     type: application
     platform: iOS
     sources:
-      - path: ThreeOneOSFive/App.swift
-      - path: ThreeOneOSFive/ContentView.swift
-      - path: ThreeOneOSFive/DNLicense.swift
+      - path: ThreeOneOSFive
+        excludes:
+          - Info.plist
     info:
       path: ThreeOneOSFive/Info.plist
       properties:
         CFBundleDisplayName: EXTERNAL IOS
         CFBundleName: EXTERNAL IOS
-        DN_LICENSE_API_URL: https://api.example.com
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.externalios.safe
