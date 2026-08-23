@@ -63,34 +63,29 @@ final class DNLicenseManager: ObservableObject {
             message = "Digite uma key válida."
             return
         }
-
         await validateOrActivate(key: normalized, allowActivation: true)
-        if isLicensed {
-            DNKeychain.write(normalized, account: "license_key")
-        }
+        if isLicensed { DNKeychain.write(normalized, account: "license_key") }
     }
 
     private func validateOrActivate(key: String, allowActivation: Bool) async {
         isLoading = true
         defer { isLoading = false }
-
         do {
-            let result = try await validateKey(key)
-            let code = result.code.uppercased()
+            let first = try await validateKey(key)
+            let code = first.code.uppercased()
 
-            if result.valid {
+            if first.valid {
                 isLicensed = true
                 message = "Licença válida."
                 return
             }
 
-            if allowActivation && code == "NO_MACHINE" {
-                guard let licenseID = result.licenseID, !licenseID.isEmpty else {
+            if allowActivation && (code == "NO_MACHINE" || code == "NO_MACHINES") {
+                guard let licenseID = first.licenseID, !licenseID.isEmpty else {
                     isLicensed = false
-                    message = "Resposta de licença inválida."
+                    message = "Key encontrada, mas o ID da licença não veio na resposta."
                     return
                 }
-
                 try await activateMachine(key: key, licenseID: licenseID)
                 let second = try await validateKey(key)
                 isLicensed = second.valid
@@ -99,20 +94,10 @@ final class DNLicenseManager: ObservableObject {
             }
 
             isLicensed = false
-            message = friendlyMessage(for: code, detail: result.detail)
-        } catch let error as URLError {
-            isLicensed = false
-            switch error.code {
-            case .notConnectedToInternet, .networkConnectionLost:
-                message = "Sem conexão com a internet."
-            case .timedOut:
-                message = "O Keygen demorou para responder."
-            default:
-                message = "Falha de comunicação com o Keygen (\(error.code.rawValue))."
-            }
+            message = friendlyMessage(for: first.code, detail: first.detail)
         } catch {
             isLicensed = false
-            message = "Erro ao validar licença: \(error.localizedDescription)"
+            message = "Erro: \(error.localizedDescription)"
         }
     }
 
@@ -145,15 +130,10 @@ final class DNLicenseManager: ObservableObject {
         ])
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw URLError(.badServerResponse)
-        }
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
 
         guard (200..<300).contains(http.statusCode) else {
-            let detail = parseAPIError(data) ?? "HTTP \(http.statusCode)"
-            if http.statusCode == 404 {
-                return ValidationResult(valid: false, code: "NOT_FOUND", detail: detail, licenseID: nil)
-            }
+            let detail = parseAPIError(data) ?? String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
             return ValidationResult(valid: false, code: "HTTP_\(http.statusCode)", detail: detail, licenseID: nil)
         }
 
@@ -165,7 +145,6 @@ final class DNLicenseManager: ObservableObject {
         let valid = meta?["valid"] as? Bool ?? false
         let code = meta?["code"] as? String ?? (valid ? "VALID" : "INVALID")
         let detail = meta?["detail"] as? String
-
         let license = object["data"] as? [String: Any]
         let licenseID = license?["id"] as? String
 
@@ -204,12 +183,9 @@ final class DNLicenseManager: ObservableObject {
         ])
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw URLError(.badServerResponse)
-        }
-
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard (200..<300).contains(http.statusCode) else {
-            let detail = parseAPIError(data) ?? "HTTP \(http.statusCode)"
+            let detail = parseAPIError(data) ?? String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
             throw NSError(domain: "KeygenActivation", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: detail])
         }
     }
@@ -218,40 +194,27 @@ final class DNLicenseManager: ObservableObject {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let errors = object["errors"] as? [[String: Any]],
               let first = errors.first else { return nil }
-        return (first["detail"] as? String) ?? (first["title"] as? String)
+        return (first["detail"] as? String) ?? (first["title"] as? String) ?? (first["code"] as? String)
     }
 
     private func friendlyMessage(for code: String, detail: String?) -> String {
         switch code.uppercased() {
-        case "VALID":
-            return "Licença válida."
-        case "FINGERPRINT_SCOPE_MISMATCH":
-            return "Esta key já está vinculada a outro dispositivo."
-        case "POLICY_SCOPE_MISMATCH":
-            return "Esta key não pertence ao EXTERNAL IOS."
-        case "EXPIRED":
-            return "Esta key expirou."
-        case "SUSPENDED":
-            return "Esta key foi suspensa."
-        case "BANNED":
-            return "Esta licença foi bloqueada."
-        case "NO_MACHINE":
-            return "Esta key ainda não foi ativada neste iPhone."
-        case "NOT_FOUND", "INVALID":
-            return "Key inválida."
-        case "POLICY_SCOPE_REQUIRED":
-            return "A licença exige a policy correta."
-        case "FINGERPRINT_SCOPE_REQUIRED":
-            return "A licença exige identificação do dispositivo."
-        default:
-            return detail ?? "Licença não autorizada (\(code))."
+        case "VALID": return "Licença válida."
+        case "NO_MACHINE", "NO_MACHINES": return "Key válida, aguardando ativação deste iPhone."
+        case "FINGERPRINT_SCOPE_MISMATCH": return "Esta key já está vinculada a outro dispositivo."
+        case "POLICY_SCOPE_MISMATCH": return "Esta key pertence a outra policy."
+        case "POLICY_SCOPE_REQUIRED": return "A policy exige escopo de policy."
+        case "FINGERPRINT_SCOPE_REQUIRED": return "A policy exige identificação do dispositivo."
+        case "EXPIRED": return "Esta key expirou."
+        case "SUSPENDED": return "Esta key foi suspensa."
+        case "TOO_MANY_MACHINES": return "Esta key atingiu o limite de dispositivos."
+        case "INVALID", "NOT_FOUND": return "Key inválida."
+        default: return detail ?? "Licença não autorizada (\(code))."
         }
     }
 }
 
-enum DNVisualTheme {
-    static let accent = Color.purple
-}
+enum DNVisualTheme { static let accent = Color.purple }
 
 struct DNLicenseActivationView: View {
     @ObservedObject var manager: DNLicenseManager
@@ -261,15 +224,11 @@ struct DNLicenseActivationView: View {
         NavigationStack {
             VStack(spacing: 20) {
                 Spacer()
-                Image(systemName: "key.fill")
-                    .font(.system(size: 52))
-                    .foregroundStyle(DNVisualTheme.accent)
-                Text("EXTERNAL IOS")
-                    .font(.largeTitle.bold())
-                Text("Keygen License")
-                    .foregroundStyle(.secondary)
+                Image(systemName: "key.fill").font(.system(size: 52)).foregroundStyle(DNVisualTheme.accent)
+                Text("EXTERNAL IOS").font(.largeTitle.bold())
+                Text("Keygen License").foregroundStyle(.secondary)
                 SecureField("Digite sua key", text: $key)
-                    .textInputAutocapitalization(.characters)
+                    .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .textFieldStyle(.roundedBorder)
                 Button {
