@@ -39,7 +39,5 @@
     <array>
         <string>UIInterfaceOrientationPortrait</string>
     </array>
-    <key>DN_LICENSE_API_URL</key>
-    <string>https://api.example.com</string>
 </dict>
 </plist>
