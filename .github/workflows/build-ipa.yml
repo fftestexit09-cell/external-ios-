@@ -1,0 +1,56 @@
+name: Build EXTERNAL IOS Safe IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Inject DN License URL
+        if: ${{ vars.DN_LICENSE_API_URL != '' }}
+        env:
+          DN_LICENSE_API_URL: ${{ vars.DN_LICENSE_API_URL }}
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :DN_LICENSE_API_URL $DN_LICENSE_API_URL" ThreeOneOSFive/Info.plist || \
+          /usr/libexec/PlistBuddy -c "Add :DN_LICENSE_API_URL string $DN_LICENSE_API_URL" ThreeOneOSFive/Info.plist
+      - name: Build unsigned app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project ThreeOneOSFive.xcodeproj \
+            -target 3105 \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP=$(find build -type d -name '3105.app' -path '*Release-iphoneos*' -print -quit)
+          test -n "$APP"
+          rm -rf Payload EXTERNAL_IOS_SAFE_UNSIGNED.ipa
+          mkdir Payload
+          ditto "$APP" Payload/3105.app
+          zip -qry EXTERNAL_IOS_SAFE_UNSIGNED.ipa Payload
+          shasum -a 256 EXTERNAL_IOS_SAFE_UNSIGNED.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXTERNAL_IOS_SAFE_UNSIGNED
+          path: EXTERNAL_IOS_SAFE_UNSIGNED.ipa
+          if-no-files-found: error
+          retention-days: 30
