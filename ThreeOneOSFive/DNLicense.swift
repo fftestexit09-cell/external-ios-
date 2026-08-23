@@ -3,7 +3,7 @@ import SwiftUI
 import Security
 
 private enum DNKeychain {
-    static let service = "com.externalios.dnlicense"
+    static let service = "com.externalios.keygen"
 
     static func read(_ account: String) -> String? {
         let query: [String: Any] = [
@@ -34,18 +34,27 @@ private enum DNKeychain {
     }
 }
 
+private struct KeygenValidationResult {
+    let valid: Bool
+    let code: String
+    let detail: String?
+    let licenseID: String?
+}
+
 @MainActor
 final class DNLicenseManager: ObservableObject {
     @Published var isLicensed = false
     @Published var message = ""
     @Published var isLoading = false
+    @Published var debugStatus = "READY"
 
+    // Public identifiers only. No admin/product tokens are embedded in the app.
     private let account = "2aca6104"
     private let policyID = "61ec76e6-511e-4888-8f99-8177ee8abeff"
     private let apiRoot = URL(string: "https://api.keygen.sh/v1")!
 
     private var installationID: String {
-        if let existing = DNKeychain.read("installation_id") { return existing }
+        if let existing = DNKeychain.read("installation_id"), !existing.isEmpty { return existing }
         let value = UUID().uuidString.lowercased()
         DNKeychain.write(value, account: "installation_id")
         return value
@@ -59,7 +68,6 @@ final class DNLicenseManager: ObservableObject {
     func activate(key: String) async {
         let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else {
-            isLicensed = false
             message = "Digite uma key válida."
             return
         }
@@ -69,10 +77,14 @@ final class DNLicenseManager: ObservableObject {
 
     private func validateOrActivate(key: String, allowActivation: Bool) async {
         isLoading = true
+        isLicensed = false
+        debugStatus = "VALIDATING"
         defer { isLoading = false }
+
         do {
             let first = try await validateKey(key)
             let code = first.code.uppercased()
+            debugStatus = "KEYGEN: \(code)"
 
             if first.valid {
                 isLicensed = true
@@ -80,35 +92,28 @@ final class DNLicenseManager: ObservableObject {
                 return
             }
 
-            if allowActivation && (code == "NO_MACHINE" || code == "NO_MACHINES") {
+            if allowActivation && ["NO_MACHINE", "NO_MACHINES", "FINGERPRINT_SCOPE_MISMATCH"].contains(code) {
                 guard let licenseID = first.licenseID, !licenseID.isEmpty else {
-                    isLicensed = false
-                    message = "Key encontrada, mas o ID da licença não veio na resposta."
+                    message = first.detail ?? "Key encontrada, mas a API não retornou o ID da licença."
                     return
                 }
+
                 try await activateMachine(key: key, licenseID: licenseID)
                 let second = try await validateKey(key)
+                debugStatus = "KEYGEN: \(second.code.uppercased())"
                 isLicensed = second.valid
                 message = second.valid ? "Licença ativada neste iPhone." : friendlyMessage(for: second.code, detail: second.detail)
                 return
             }
 
-            isLicensed = false
             message = friendlyMessage(for: first.code, detail: first.detail)
-        } catch {
-            isLicensed = false
-            message = "Erro: \(error.localizedDescription)"
+        } catch let error as NSError {
+            debugStatus = "ERROR: \(error.code)"
+            message = error.localizedDescription
         }
     }
 
-    private struct ValidationResult {
-        let valid: Bool
-        let code: String
-        let detail: String?
-        let licenseID: String?
-    }
-
-    private func validateKey(_ key: String) async throws -> ValidationResult {
+    private func validateKey(_ key: String) async throws -> KeygenValidationResult {
         let url = apiRoot
             .appendingPathComponent("accounts")
             .appendingPathComponent(account)
@@ -119,36 +124,40 @@ final class DNLicenseManager: ObservableObject {
         request.timeoutInterval = 20
         request.setValue("application/vnd.api+json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/vnd.api+json", forHTTPHeaderField: "Accept")
+
+        // Keygen docs show fingerprint scoping client-side. Policy scoping is kept to
+        // ensure the license belongs to this exact EXTERNAL IOS policy.
         request.httpBody = try JSONSerialization.data(withJSONObject: [
             "meta": [
                 "key": key,
                 "scope": [
-                    "policy": policyID,
-                    "fingerprint": installationID
+                    "fingerprint": installationID,
+                    "policy": policyID
                 ]
             ]
         ])
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard let http = response as? HTTPURLResponse else {
+            throw NSError(domain: "Keygen", code: -1, userInfo: [NSLocalizedDescriptionKey: "Resposta HTTP inválida do Keygen."])
+        }
 
         guard (200..<300).contains(http.statusCode) else {
             let detail = parseAPIError(data) ?? String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
-            return ValidationResult(valid: false, code: "HTTP_\(http.statusCode)", detail: detail, licenseID: nil)
+            throw NSError(domain: "KeygenHTTP", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Keygen HTTP \(http.statusCode): \(detail)"])
         }
 
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw URLError(.cannotParseResponse)
+            throw NSError(domain: "Keygen", code: -2, userInfo: [NSLocalizedDescriptionKey: "Não foi possível interpretar a resposta do Keygen."])
         }
 
         let meta = object["meta"] as? [String: Any]
         let valid = meta?["valid"] as? Bool ?? false
-        let code = meta?["code"] as? String ?? (valid ? "VALID" : "INVALID")
+        let code = (meta?["code"] as? String) ?? (valid ? "VALID" : "INVALID")
         let detail = meta?["detail"] as? String
-        let license = object["data"] as? [String: Any]
-        let licenseID = license?["id"] as? String
+        let licenseID = (object["data"] as? [String: Any])?["id"] as? String
 
-        return ValidationResult(valid: valid, code: code, detail: detail, licenseID: licenseID)
+        return KeygenValidationResult(valid: valid, code: code, detail: detail, licenseID: licenseID)
     }
 
     private func activateMachine(key: String, licenseID: String) async throws {
@@ -169,24 +178,23 @@ final class DNLicenseManager: ObservableObject {
                 "attributes": [
                     "fingerprint": installationID,
                     "platform": "iOS",
-                    "name": "iPhone"
+                    "name": "EXTERNAL IOS iPhone"
                 ],
                 "relationships": [
                     "license": [
-                        "data": [
-                            "type": "licenses",
-                            "id": licenseID
-                        ]
+                        "data": ["type": "licenses", "id": licenseID]
                     ]
                 ]
             ]
         ])
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard let http = response as? HTTPURLResponse else {
+            throw NSError(domain: "Keygen", code: -3, userInfo: [NSLocalizedDescriptionKey: "Resposta inválida ao ativar dispositivo."])
+        }
         guard (200..<300).contains(http.statusCode) else {
             let detail = parseAPIError(data) ?? String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
-            throw NSError(domain: "KeygenActivation", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: detail])
+            throw NSError(domain: "KeygenActivation", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Ativação HTTP \(http.statusCode): \(detail)"])
         }
     }
 
@@ -200,11 +208,11 @@ final class DNLicenseManager: ObservableObject {
     private func friendlyMessage(for code: String, detail: String?) -> String {
         switch code.uppercased() {
         case "VALID": return "Licença válida."
-        case "NO_MACHINE", "NO_MACHINES": return "Key válida, aguardando ativação deste iPhone."
-        case "FINGERPRINT_SCOPE_MISMATCH": return "Esta key já está vinculada a outro dispositivo."
+        case "NO_MACHINE", "NO_MACHINES": return "Key válida, mas ainda não ativada neste iPhone."
+        case "FINGERPRINT_SCOPE_MISMATCH": return "Key válida, porém vinculada a outro dispositivo."
         case "POLICY_SCOPE_MISMATCH": return "Esta key pertence a outra policy."
-        case "POLICY_SCOPE_REQUIRED": return "A policy exige escopo de policy."
-        case "FINGERPRINT_SCOPE_REQUIRED": return "A policy exige identificação do dispositivo."
+        case "POLICY_SCOPE_REQUIRED": return "O Keygen exige o escopo da policy."
+        case "FINGERPRINT_SCOPE_REQUIRED": return "O Keygen exige o fingerprint do dispositivo."
         case "EXPIRED": return "Esta key expirou."
         case "SUSPENDED": return "Esta key foi suspensa."
         case "TOO_MANY_MACHINES": return "Esta key atingiu o limite de dispositivos."
@@ -222,18 +230,28 @@ struct DNLicenseActivationView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 20) {
+            VStack(spacing: 18) {
                 Spacer()
-                Image(systemName: "key.fill").font(.system(size: 52)).foregroundStyle(DNVisualTheme.accent)
-                Text("EXTERNAL IOS").font(.largeTitle.bold())
-                Text("Keygen License").foregroundStyle(.secondary)
-                Text("KEYGEN BUILD 2")
-                    .font(.caption.bold())
+                Image(systemName: "key.fill")
+                    .font(.system(size: 50))
+                    .foregroundStyle(DNVisualTheme.accent)
+
+                Text("EXTERNAL IOS")
+                    .font(.largeTitle.bold())
+
+                Text("KEYGEN BUILD 3")
+                    .font(.headline.bold())
                     .foregroundStyle(.purple)
+
+                Text("Account 2aca6104 • Policy ...abeff")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
                 SecureField("Digite sua key", text: $key)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .textFieldStyle(.roundedBorder)
+
                 Button {
                     Task { await manager.activate(key: key) }
                 } label: {
@@ -241,6 +259,11 @@ struct DNLicenseActivationView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || manager.isLoading)
+
+                Text(manager.debugStatus)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+
                 if !manager.message.isEmpty {
                     Text(manager.message)
                         .font(.footnote)
