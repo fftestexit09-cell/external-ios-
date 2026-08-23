@@ -1,0 +1,26 @@
+name: ThreeOneOSFive
+options:
+  bundleIdPrefix: com.externalios
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: 17.0
+    SWIFT_VERSION: 5.0
+targets:
+  3105:
+    type: application
+    platform: iOS
+    sources:
+      - path: ThreeOneOSFive/App.swift
+      - path: ThreeOneOSFive/ContentView.swift
+      - path: ThreeOneOSFive/DNLicense.swift
+    info:
+      path: ThreeOneOSFive/Info.plist
+      properties:
+        CFBundleDisplayName: EXTERNAL IOS
+        CFBundleName: EXTERNAL IOS
+        DN_LICENSE_API_URL: https://api.example.com
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.externalios.safe
+        PRODUCT_NAME: "3105"
+        GENERATE_INFOPLIST_FILE: NO
