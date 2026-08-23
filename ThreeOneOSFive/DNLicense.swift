@@ -48,8 +48,7 @@ final class DNLicenseManager: ObservableObject {
     @Published var isLoading = false
     @Published var debugStatus = "READY"
 
-    // Public identifiers only. No admin/product tokens are embedded in the app.
-    private let account = "2aca6104"
+    private let account = "renatokaua07"
     private let policyID = "61ec76e6-511e-4888-8f99-8177ee8abeff"
     private let apiRoot = URL(string: "https://api.keygen.sh/v1")!
 
@@ -124,9 +123,6 @@ final class DNLicenseManager: ObservableObject {
         request.timeoutInterval = 20
         request.setValue("application/vnd.api+json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/vnd.api+json", forHTTPHeaderField: "Accept")
-
-        // Keygen docs show fingerprint scoping client-side. Policy scoping is kept to
-        // ensure the license belongs to this exact EXTERNAL IOS policy.
         request.httpBody = try JSONSerialization.data(withJSONObject: [
             "meta": [
                 "key": key,
@@ -239,11 +235,11 @@ struct DNLicenseActivationView: View {
                 Text("EXTERNAL IOS")
                     .font(.largeTitle.bold())
 
-                Text("KEYGEN BUILD 3")
+                Text("KEYGEN BUILD 4")
                     .font(.headline.bold())
                     .foregroundStyle(.purple)
 
-                Text("Account 2aca6104 • Policy ...abeff")
+                Text("Account renatokaua07 • Policy ...abeff")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
